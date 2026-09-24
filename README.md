@@ -1,3 +1,10 @@
+
+
+<img width="1153" height="601" alt="image" src="https://github.com/user-attachments/assets/1f697c3b-ae73-4a8c-a55f-687948af3dfc" />
+
+
+
+
 # DOT-Carrier-Scorecard
 SQL + Tableau carrier safety risk scorecard using FMCSA data
 # Carrier Risk Scorecard: Predicting Out-of-Service Risk for Shippers
