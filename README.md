@@ -1,103 +1,130 @@
-
-
-<img width="1153" height="601" alt="image" src="https://github.com/user-attachments/assets/1f697c3b-ae73-4a8c-a55f-687948af3dfc" />
-
-
-
-
-# DOT-Carrier-Scorecard
-SQL + Tableau carrier safety risk scorecard using FMCSA data
-# Carrier Risk Scorecard: Predicting Out-of-Service Risk for Shippers
+# Carrier Risk Scorecard: Do Carrier Characteristics Predict Out-of-Service Risk?
 
 ## What this is
 
-If you're a shipper picking a motor carrier, reliability is of the utmost importance and you want to know one thing up front: is this carrier likely to get pulled off the road? This project digs into that question using public FMCSA data — carrier census records, roadside inspections, and crash reports — and builds a risk scorecard for carriers operating in the NJ/NY/PA/DE/CT corridor.
+If you're a shipper picking a motor carrier, you want to know whether the carrier is likely to get pulled off the road. I used public FMCSA data (carrier census records, roadside inspections, and crash reports) to look at carriers operating in the NJ/NY/PA/DE/CT corridor and ask a simple question: **do the things you can see about a carrier, like fleet size, mileage, operation type, and safety rating, actually predict out-of-service (OOS) and crash risk?**
 
-Question I set out to answer:** which observable carrier characteristics actually predict out-of-service (OOS) and safety risk, and what would a usable scorecard look like for someone making a hiring decision?
+Short version of the answer: mostly no. I built the scorecard anyway, but the more useful result turned out to be how weak those signals are, and how easy it was to fool myself along the way. The sections below walk through what I did, what I found, and what I had to walk back.
 
-Tools:MySQL for cleaning and joining the data, Tableau for the analysis and dashboard, a bit of Excel for reviews.
+**Tools:** MySQL (cleaning, joins, aggregation), Tableau (dashboard), Excel Analysis ToolPak (regression).
 
-Data: pulled from [data.transportation.gov](https://data.transportation.gov) — FMCSA's Motor Carrier Census, Inspection, and Crash files.
+**Data:** [data.transportation.gov](https://data.transportation.gov), FMCSA Motor Carrier Census, Inspection, and Crash files.
 
+---
 
 ## The data
 
 Three files, linked by `DOT_NUMBER` (the federal carrier ID):
 
-COMPANY_CENSUS - One row per carrier filing — fleet size, mileage, cargo type, operation type, safety rating
-INSPECTION_FILE - One row per roadside inspection — violations and OOS counts, split out by Driver/Vehicle/Hazmat
-CRASH_FILE - One row per crash — fatalities, injuries, tow-away, location 
+| File | What it is |
+|---|---|
+| `COMPANY_CENSUS` | One row per carrier filing: fleet size, mileage, cargo type, operation type, safety rating |
+| `INSPECTION_FILE` | One row per roadside inspection: violations and OOS counts, split by Driver/Vehicle/Hazmat |
+| `CRASH_FILE` | One row per crash: fatalities, injuries, tow-away, location |
 
+---
 
 ## Getting the data clean was most of the work
 
-I'm including this section because diagnosing what went wrong with this dataset took longer than the actual analysis, and I think it's worth showing that process.
+I'm keeping this section detailed because diagnosing what was wrong with this dataset took longer than the analysis itself.
 
-1. The census file was silently truncated by Excel. My first COMPANY_CENSUS extract had exactly 1,048,576 rows which is Excel's hard row limit. Somewhere along the way I had opened it in Excel, which quietly chopped a multi-million-row national file down to a single sheet. I only caught this because my join against the inspection/crash files was only matching about 2% of carriers, which made no sense for a national dataset. I re-loaded the raw CSV straight into MySQL with `LOAD DATA INFILE', no Excel in between, and got the full ~4.5M carrier population back.
+**1. Excel had silently truncated the census file.** My first `COMPANY_CENSUS` extract had exactly 1,048,576 rows, which is Excel's hard row limit. A multi-million-row national file had been cut down to one sheet. I only noticed because my join was matching about 2% of carriers, which made no sense. I reloaded the raw CSV straight into MySQL with `LOAD DATA INFILE` and got the full ~4.5M carriers back.
 
-2. I double-checked the join key before assuming anything else was wrong. Before chasing other theories, I verified `DOT_NUMBER` formats and ranges matched across all three tables — ruled out a format mismatch as the cause and helped me isolate the actual problem above.
+**2. I checked the join key before blaming anything else.** I confirmed `DOT_NUMBER` formats and ranges matched across all three tables. That ruled out a format mismatch and pointed me back at the truncation.
 
-3. Duplicate carriers in the census. About 36,600 `DOT_NUMBER`s had more than one row (carriers file updates over time). I deduplicated to the most recent filing using `MCS150_DATE`, falling back to `ADD_DATE` for roughly 587,000 carriers that had no valid filing date at all.
+**3. Duplicate carriers in the census.** About 36,600 `DOT_NUMBER`s had more than one row, since carriers file updates over time. I kept the most recent filing by `MCS150_DATE`, falling back to `ADD_DATE` for roughly 587,000 carriers with no valid filing date.
 
-4. My local MySQL server kept crashing. Several dedup/join steps — an `ALTER TABLE`, a `ROW_NUMBER()` window function both killed the connection outright. Buffer pool increase resolved this issue.
+**4. My local MySQL server kept crashing.** An `ALTER TABLE` and a `ROW_NUMBER()` window function both killed the connection. The InnoDB error log showed the buffer pool was still at the 128MB default, far too small for a table this size. I raised it to 2GB in `my.cnf` and the crashes stopped.
 
-5. Scoping to a region wasnot as simple as filtering by home state. I wanted to narrow this to the NJ/NY/PA/DE/CT corridor to keep it manageable. My first attempt filtered carriers by their home state (`PHY_STATE`), which left me with only about 80 matched carriers. The problem seemed to be most roadside inspections and crashes involve carriers passing through a region, not just ones headquartered there. I switched to filtering by `REPORT_STATE` (where the inspection/crash actually happened) instead, which both fixed the sample size and better reflects what a regional shipper actually cares about.
+**5. Filtering by home state gave me too few carriers.** I first narrowed to the corridor by carrier home state (`PHY_STATE`) and ended up with only about 80 matched carriers. Most inspections and crashes involve carriers passing *through* a region, not just ones based there. Switching to `REPORT_STATE` (where the event happened) fixed the sample size and fits a regional shipper's actual exposure better.
 
-6. An integer overflow in the mileage field. `MCS150_MILEAGE` had values as high as 2,147,483,647 — which is exactly 2^31 - 1, not a real reported number, just a storage overflow, and it was wrecking every mileage-normalized metric. Excluded anything above a 10,000,000 mile/year ceiling before computing rates.
+**6. Integer overflow in the mileage field.** `MCS150_MILEAGE` had values up to 2,147,483,647, which is exactly 2^31 - 1, the largest signed 32-bit integer. That's a storage artifact, not a real mileage figure. I excluded anything above 10,000,000 miles/year.
 
-7. A second mileage problem I only caught by cross-checking in Tableau. fter I had my SQL-based findings, I rebuilt the same comparison in Tableau to confirm and the numbers didn't match. It turned out some carriers had reported implausible near-zero mileage (1 mile, 3 miles, 150 miles a year). Since my crash-rate metric divides by mileage, these tiny denominators blew up into meaningless rates — some over a million crashes per million miles. I added a lower bound (mileage > 1,000) alongside the existing upper bound. This changed the size of my headline finding but not the direction of it, and I only found it because I checked the same number two different ways.
+**7. Near-zero mileage, caught by checking in a second tool.** After getting SQL results, I rebuilt the same comparison in Tableau and the numbers didn't match. Some carriers reported 1, 3, or 150 miles a year, and since my crash-rate metric divides by mileage, those tiny denominators produced rates over a million crashes per million miles. I added a lower bound of 1,000 miles.
 
+**8. The label was mixing two different things, caught by the regression.** This one mattered most and is covered in the next section.
 
-## How I defined "high risk"
+---
 
-My original plan was a percentile-based cutoff on OOS inspection rate. That fell apart once I saw how thin the inspection data actually is. Even at a loose bar of 5+ inspections, only 5 carriers in my whole regional dataset qualified. 
+## How I defined "high risk", and where that went wrong
 
-So I switched to something simpler and more usable: `high_risk` = 1 if a carrier has ever had an OOS violation, a fatal crash, or an injury crash on record, 0 otherwise. It's less statistically precise — one bad incident years ago counts the same as a repeated pattern but it lets me use every carrier's full history instead of throwing out most of the data. I ended up with a pretty well-balanced split: 872 high-risk, 944 low-risk (after I fixed a duplicate-carrier bug that had inflated both counts by 39).
+`INSPECTION_FILE` is thin: even at a loose bar of 5+ inspections only 5 carriers qualified, and carriers in the final sample average about 1.09 inspections and 1.09 crashes each. A percentile-based OOS rate wasn't possible, so I used a binary flag: `high_risk = 1` if a carrier had ever had an OOS violation, a fatal crash, or an injury crash.
 
+That flag has a flaw I didn't catch until I ran the regression. Carriers enter the dataset through the crash file, the inspection file, or both, and the two doors have very different base rates:
+
+| How the carrier entered the data | Carriers | % flagged high-risk |
+|---|---|---|
+| Crash file only | 652 | 57.4% |
+| Inspection file only | 420 | 21.2% |
+| Both | 9 | 88.9% |
+
+A crash-only carrier is flagged by an injury or fatal crash, and an inspection-only carrier needs an OOS violation. Those aren't comparable events, so part of the label measures *which file a carrier appeared in* rather than anything about the carrier. It also explains something that confused me earlier: the 735 carriers I excluded for bad mileage were flagged more often (54.6% vs. 43.6%), but that's because the excluded group is almost entirely crash-only carriers, not because bad mileage data signals risk.
+
+**The fix** was to stop pooling and model each outcome on its own population: any OOS violation among inspected carriers, and any injury or fatal crash among crashed carriers.
+
+---
 
 ## What I found
 
-High-risk carriers run roughly double the fleet size and double the annual mileage of low-risk carriers. Which was to be expected - bigger fleets running more miles naturally rack up more incidents over time just from being on the road more.
+I ran linear probability models in Excel (a 0/1 outcome regressed on fleet size, mileage, operation type, and safety rating). P-values from this approach are approximate, so I treat them as supporting evidence rather than hard cutoffs.
 
-I normalized for that: crashes per million miles, and crashes per power unit. The gap held up even after normalizing, and after fixing both mileage data issues above. High-risk carriers averaged about 25 crashes per million miles vs. about 13 for low-risk carriers, roughly 92% higher. (My first pass at this, before I caught the low-end mileage bug, showed a smaller ~58% gap. The direction didn't change, but the corrected number is the one I trust.)
+**With the pooled label, safety rating looked like the strongest predictor.** Rated carriers were about 21 points more likely to be flagged, and that was the biggest effect in the model. Once I controlled for how the carrier entered the data, the rating effect shrank to a few points and stopped being significant. Rated carriers are mostly crash-only carriers (70% of crash-only carriers are rated vs. 19% of inspection-only), and within each group, rated and unrated carriers look alike. Adding the source control also took the model's R² from about 4% to about 14%, which shows how much of the pooled result was the label itself.
 
-That tells me fleet size isn't purely an exposure artifact here, bigger carriers in this sample are also getting into more crashes per mile driven, not just more crashes in total from driving more.
+**Split by outcome:**
 
-A couple other things worth calling out:
+| Model | Sample | Outcome (base rate) | What predicts it |
+|---|---|---|---|
+| OOS risk | 429 inspected carriers | Any OOS violation (20.7%) | Nothing. Fleet size, mileage, operation type, and rating are all insignificant (R² about 1%) |
+| Crash severity | 661 crashed carriers | Any injury or fatal crash (57.8%) | Intrastate non-hazmat carriers: +19.5 points. Having a safety rating: +8.5 points, borderline (R² about 1%) |
 
-Safety rating: carriers with an Unsatisfactory rating show a 70% high-risk rate, clearly above Conditional (59.6%), unrated (58.9%), and Satisfactory (57.1%), which are all fairly close to each other.
-Carrier operation type: intrastate non-hazmat carriers (`CARRIER_OPERATION = C`) show a 66.2% high-risk rate vs. 57.2% for interstate carriers (`A`)
+**What I'd tell a shipper:** in this corridor, fleet size, mileage, and safety rating don't reliably separate carriers that get OOS orders from carriers that don't. The one signal that held up is that, among carriers that had a crash, intrastate non-hazmat carriers were more likely to have a severe one. I wouldn't read much into it beyond "worth a closer look," since the models explain only about 1% of the variation.
 
+### A finding I walked back
 
-## Where this analysis is limited
+An earlier version of this project reported that high-risk carriers had a ~92% higher crash rate per million miles. I no longer stand behind that. Crash rate only exists for carriers with at least one crash, and `high_risk` requires an injury or fatal crash, so carriers with more crashes had more chances to qualify. Part of that gap is mechanical. I also originally wrote that high-risk carriers have double the fleet size of low-risk carriers, which came from the larger sample before the mileage filter and was driven by a few very large carriers. Among carriers with valid mileage, average fleet size is 49 trucks vs. 43 (medians 14 vs. 12).
 
-It's scoped to one corridor (NJ/NY/PA/DE/CT)
-`SAFETY_RATING` is missing for about 43% of carriers, since FMCSA only formally rates carriers pulled in for a compliance review. Some of what looks like a "rating effect" could really be a "this carrier already drew scrutiny" effect
-The normalized crash-rate numbers only cover carriers with usable mileage data (excluding both the overflow values and the near-zero junk values). Carriers left out of that subset could behave differently
-Even after the 1,000-mile floor, a small carrier with very few miles can still swing to an extreme rate off a single crash. Treat small-fleet numbers as noisier than large-fleet ones
-`high_risk` is a lifetime flag, so it doesn't distinguish a carrier with one old incident from one with a recent pattern
-Conclusions specifically about OOS/inspection behavior rest on a smaller sample than the crash-based findings, since `INSPECTION_FILE` itself is a small file
+---
 
+## Limitations
+
+- The regression sample is the 1,081 carriers with valid mileage, about 60% of the 1,816 carriers in the regional population. The excluded 735 are mostly crash-only carriers with missing census data, so the results don't speak for them.
+- Each carrier averages roughly one inspection and one crash, so per-carrier rates are really single observations. Small carriers in particular swing wildly on one event.
+- Carriers that show up in only one file are treated as having no event in the other, but that may just mean the other file didn't capture them. "Not flagged" can't be told apart from "not observed."
+- All the models explain very little (R² of 1% to 14%). A weak result is still a result, but I can't claim to have found strong drivers of risk.
+- Findings are specific to the NJ/NY/PA/DE/CT corridor.
+- `SAFETY_RATING` is missing for about half of carriers, and the 4 carriers rated Unsatisfactory in the regression sample are too few to say anything about.
+- Linear probability models are an approximation for a 0/1 outcome.
+
+---
 
 ## Dashboard
 
-Built out an interactive Tableau dashboard with five linked views: crash rate by risk group, fleet size vs. crash rate (log scale, since the data's heavily skewed), risk rate by safety rating, risk rate by carrier operation, and a full carrier lookup table. The views are cross-filtered — click a bar in any of the summary charts and the carrier table filters down to match.
+I built an interactive Tableau dashboard with five linked, cross-filtered views: crash rate by risk group, fleet size vs. crash rate (log scale), risk rate by safety rating, risk rate by carrier operation, and a carrier lookup table. Click a bar in any summary chart and the table filters to match.
 
-Live dashboard: https://public.tableau.com/app/profile/jt.mcgahran/viz/DOTCarrierRiskScorecard/ScorecardDashboard?publish=yes
+**Heads up:** the dashboard was built before I found the label problem described above. The risk-rate-by-rating and risk-rate-by-operation charts use the pooled `high_risk` flag, so they carry the same source-mix effect, and the crash-rate chart is the one I walked back. I'd read the dashboard as an exploration of the data rather than as evidence of what drives risk.
 
+**Live dashboard:** https://public.tableau.com/app/profile/jt.mcgahran/viz/DOTCarrierRiskScorecard/ScorecardDashboard
+
+---
 
 ## What's left
 
-[x] Build the Tableau dashboard
-[x] Compare high_risk across carrier operation type and safety rating (queries in `/sql/05_outlier_cleanup_and_analysis.sql`)
-[ ] Maybe run a linear probability model in Excel for a more quantified "which factors matter" answer
-[ ] Look at cargo type (`CRGO_*` fields) as another possible predictor
+- [x] Build the Tableau dashboard
+- [x] Run regressions and check them for confounding
+- [ ] Rebuild the dashboard views around the split outcomes (OOS among inspected carriers, severe crashes among crashed carriers)
+- [ ] Look at cargo type (`CRGO_*` fields) as another possible predictor
+- [ ] Try a logistic regression, since the linear probability model is only an approximation
 
-
+---
 
 ## Repo layout
 
-/sql/          all five SQL scripts, in the order I actually ran them
+```
+/sql/          SQL scripts, in the order I ran them
+               01 load + dedup census, 02 regional scope, 03 aggregate metrics,
+               04 scorecard + labels, 05 mileage cleanup + exploratory comparisons,
+               06 split outcomes (the datasets behind the regressions)
+/excel/        regression workbook (Analysis ToolPak output)
 /tableau/      the Tableau workbook
 README.md      this file
 ```
